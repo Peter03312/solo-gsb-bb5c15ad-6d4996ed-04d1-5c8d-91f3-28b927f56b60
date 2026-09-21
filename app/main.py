@@ -9,6 +9,8 @@ from fastapi.responses import JSONResponse
 from .geofence import assign_zones, build_fence, summarize_fences
 from .hotspot import find_hotspots
 from .models import (
+    GeofenceRouteCheckRequest,
+    GeofenceRouteCheckResponse,
     GeofenceStay,
     GeofenceSummary,
     GeofenceVisitRequest,
@@ -17,21 +19,25 @@ from .models import (
     HotspotRequest,
     HotspotResponse,
     HotspotStay,
+    RouteStep,
+    RouteViolation,
     Stay,
     StayRequest,
     StayResponse,
     Stats,
 )
+from .route_check import build_visit_events, check_route
 from .staypoint import Point, StaySegment, detect_stays, total_distance_m
 
 app = FastAPI(
     title="轨迹停留分析 API",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "提交带时间戳的有序轨迹，按 Haversine 距离与最短停留时长阈值流式合并连续点，"
         "识别停留区段（含跨采样间断切分），返回停留时长、中心点、原始点范围，"
         "并提供 GeoJSON 结果、总里程统计、基于停留中心连通分量的跨时段热点归并，"
-        "以及基于停留中心点面归属的围栏访问统计（支持孔洞与跨 180° 经线多边形）。"
+        "基于停留中心点面归属的围栏访问统计（支持孔洞与跨 180° 经线多边形），"
+        "以及轨迹是否按给定围栏路线依次、按时访问的路线核对。"
     ),
 )
 
@@ -172,6 +178,55 @@ def _analyze_geofence_visits(req: GeofenceVisitRequest) -> GeofenceVisitResponse
     )
 
 
+def _analyze_geofence_route_check(
+    req: GeofenceRouteCheckRequest,
+) -> GeofenceRouteCheckResponse:
+    segments = _detect_segments(req)
+    fences = [
+        build_fence(g.zone_id, g.priority, g.geometry.model_dump())
+        for g in req.geofences
+    ]
+    assignments = assign_zones(segments, fences)
+
+    events = build_visit_events(segments, assignments)
+    result = check_route(
+        events,
+        ordered_zone_ids=req.ordered_zone_ids,
+        max_step_gap_s=req.max_step_gap_s,
+    )
+
+    steps = [
+        RouteStep(
+            step_index=s.step_index,
+            zone_id=s.zone_id,
+            matched=s.matched,
+            stay_ids=s.stay_ids,
+            entry_time=s.entry_time,
+            exit_time=s.exit_time,
+            gap_s=s.gap_s,
+        )
+        for s in result.steps
+    ]
+    violations = [
+        RouteViolation(
+            type=v.kind,
+            step_index=v.step_index,
+            zone_id=v.zone_id,
+            stay_ids=v.stay_ids,
+            entry_time=v.entry_time,
+            expected_zone_id=v.expected_zone_id,
+            deadline_time=v.deadline_time,
+        )
+        for v in result.violations
+    ]
+    return GeofenceRouteCheckResponse(
+        matched_stay_ids=result.matched_stay_ids,
+        route_steps=steps,
+        violations=violations,
+        overall_pass=result.overall_pass,
+    )
+
+
 @app.get("/health", summary="健康检查")
 def health() -> dict:
     return {"status": "ok"}
@@ -202,6 +257,17 @@ def analyze_hotspots(req: HotspotRequest) -> HotspotResponse:
 )
 def analyze_geofence_visits(req: GeofenceVisitRequest) -> GeofenceVisitResponse:
     return _analyze_geofence_visits(req)
+
+
+@app.post(
+    "/api/v1/geofence-route-check",
+    response_model=GeofenceRouteCheckResponse,
+    summary="围栏路线核对（按 ordered_zone_ids 依次、按时访问）",
+)
+def analyze_geofence_route_check(
+    req: GeofenceRouteCheckRequest,
+) -> GeofenceRouteCheckResponse:
+    return _analyze_geofence_route_check(req)
 
 
 @app.post(

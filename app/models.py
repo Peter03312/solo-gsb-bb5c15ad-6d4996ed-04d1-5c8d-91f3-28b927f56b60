@@ -252,3 +252,104 @@ class GeofenceVisitResponse(BaseModel):
     stays: List[GeofenceStay]
     geofences: List[GeofenceSummary]
     stats: Stats
+
+
+# --- 围栏路线核对（POST /api/v1/geofence-route-check） ---
+
+
+class GeofenceRouteCheckRequest(GeofenceVisitRequest):
+    """围栏路线核对请求：沿用停留检测参数与围栏列表，追加期望路线。"""
+
+    ordered_zone_ids: List[str] = Field(
+        ...,
+        min_length=1,
+        description="期望依次访问的围栏编号序列，允许重复（重复项需分别到访消费）",
+    )
+    max_step_gap_s: Optional[float] = Field(
+        None,
+        gt=0,
+        description="相邻路线步骤进入时间的最大间隔（秒）：超过则缺失步骤记 missing；"
+        "为空时不做时限核对",
+    )
+
+    @model_validator(mode="after")
+    def _check_ordered_zones_known(self):
+        known = {fence.zone_id for fence in self.geofences}
+        unknown = [z for z in self.ordered_zone_ids if z not in known]
+        if unknown:
+            raise ValueError(
+                f"ordered_zone_ids 中的 zone_id 必须存在于 geofences 中：{unknown}"
+            )
+        return self
+
+
+class RouteStep(BaseModel):
+    """单个路线步骤的核对结果（顺序与请求 ordered_zone_ids 一一对应）。"""
+
+    step_index: int = Field(..., description="路线步骤序号，从 1 开始")
+    zone_id: str = Field(..., description="该步骤期望访问的围栏编号")
+    matched: bool = Field(..., description="是否按时按序命中")
+    stay_ids: List[int] = Field(
+        ...,
+        description="匹配该步骤的访问事件所含停留 stay_id（同一围栏连续停留合并为一次）；"
+        "未匹配为 []",
+    )
+    entry_time: Optional[datetime] = Field(
+        ..., description="匹配访问的进入时间（首个命中停留的进入时间）；未匹配为 null"
+    )
+    exit_time: Optional[datetime] = Field(
+        ..., description="匹配访问的离开时间（末个命中停留的离开时间）；未匹配为 null"
+    )
+    gap_s: Optional[float] = Field(
+        ...,
+        description="匹配进入时间相对上一已匹配步骤进入时间的间隔（秒）；"
+        "第一步或未匹配为 null",
+    )
+
+
+class RouteViolation(BaseModel):
+    """一次路线违规。"""
+
+    type: Literal["missing", "unexpected"] = Field(
+        ...,
+        description="违规类型：missing=期望步骤缺失（未出现或超时），"
+        "unexpected=出现非当前目标围栏的访问",
+    )
+    step_index: Optional[int] = Field(
+        ...,
+        description="missing 对应缺失的路线步骤序号；unexpected 不属于任何步骤，为 null",
+    )
+    zone_id: str = Field(..., description="缺失的围栏编号（missing）或实际到访围栏编号（unexpected）")
+    stay_ids: List[int] = Field(
+        ..., description="unexpected 访问事件所含停留 stay_id；missing 为 []"
+    )
+    entry_time: Optional[datetime] = Field(
+        ..., description="unexpected 访问的进入时间；missing 为 null"
+    )
+    expected_zone_id: Optional[str] = Field(
+        ...,
+        description="unexpected 发生时当前期望的围栏编号（路线已走完则为 null）；missing 为 null",
+    )
+    deadline_time: Optional[datetime] = Field(
+        ...,
+        description="因超时缺失时的截止时刻（锚点 + max_step_gap_s，链式推进）；"
+        "轨迹结束仍未出现或未设置时限时为 null",
+    )
+
+
+class GeofenceRouteCheckResponse(BaseModel):
+    """围栏路线核对响应。"""
+
+    matched_stay_ids: List[int] = Field(
+        ...,
+        description="所有匹配访问事件消费的停留 stay_id（按访问时间升序、已做连续合并去重）",
+    )
+    route_steps: List[RouteStep] = Field(
+        ..., description="按顺序的路线步骤核对结果，长度与 ordered_zone_ids 一致（允许重复）"
+    )
+    violations: List[RouteViolation] = Field(
+        ..., description="违规列表：missing / unexpected，按发生时间排序"
+    )
+    overall_pass: bool = Field(
+        ..., description="是否完全按路线依次、按时访问（无任何违规即 true）"
+    )

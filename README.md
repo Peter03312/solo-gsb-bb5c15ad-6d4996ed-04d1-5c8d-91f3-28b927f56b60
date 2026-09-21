@@ -6,7 +6,10 @@
 并附带 **GeoJSON** 结果与**总里程、停留次数**等统计。`/api/v1/hotspots` 进一步在停留结果之上
 以**中心连通分量**归并跨时段重复到访，输出热点（含传递扩展、稳定编号、时长加权中心）与噪声标记；
 `/api/v1/geofence-visits` 则以停留**中心点**对带洞、可跨 180° 经线的 GeoJSON 围栏做点面归属，
-返回每段停留的 `zone_id`（未命中为 `null`）及按围栏汇总的访问次数与累计停留时长。
+返回每段停留的 `zone_id`（未命中为 `null`）及按围栏汇总的访问次数与累计停留时长；
+`/api/v1/geofence-route-check` 进一步核对轨迹是否**按给定围栏路线依次、按时访问**：
+按停留进入时间消费命中围栏（同一围栏连续停留合并为一次、未命中停留跳过），输出匹配停留、
+按顺序的逐步骤核对结果与 `missing` / `unexpected` 违规。
 
 ## 功能特性
 
@@ -20,6 +23,10 @@
 - **围栏访问统计**：GeoJSON Polygon / MultiPolygon 点面归属；外环边界视为命中，洞内及洞边界视为
   未命中；多边形可跨越 180° 经线（无需预切割）；多围栏同时命中按 `priority` 降序、`zone_id`
   字典序唯一决胜；汇总保留零访问围栏
+- **围栏路线核对**：给定允许重复的 `ordered_zone_ids`，按停留进入时间有序消费围栏访问——
+  同一围栏连续停留只算一次（中间夹未命中停留不打断），未命中停留直接跳过；未按序到访记
+  `unexpected`，目标未出现 / 超过 `max_step_gap_s` 时限记 `missing`；返回逐步骤结果、
+  匹配停留编号与 `overall_pass`
 - 时间戳兼容 ISO 8601 字符串与 Unix 秒（epoch）；参数校验失败返回 422
 
 ## 快速开始
@@ -295,7 +302,89 @@ curl -X POST http://localhost:8000/api/v1/geofence-visits \
 | `geofences[].stay_ids` | 命中该围栏的停留 `stay_id`（升序） |
 | `stats` | 与 `/api/v1/stays` 相同的整体统计 |
 
-### 4. `POST /api/v1/stays/geojson` — GeoJSON 结果
+### 4. `POST /api/v1/geofence-route-check` — 围栏路线核对（依次、按时访问）
+
+**请求体**：完整沿用 `POST /api/v1/geofence-visits` 的全部字段（`points`、
+`distance_threshold_m`、`min_stay_duration_s`、`max_gap_s`、`geofences`），并额外要求：
+
+| 字段 | 类型 | 必填 | 默认值 | 说明 |
+| --- | --- | --- | --- | --- |
+| `ordered_zone_ids` | string[] | 是 | — | 期望依次访问的围栏编号序列，至少 1 个；**允许重复**，每个编号都必须存在于 `geofences` 中 |
+| `max_step_gap_s` | float | 否 | 不做时限核对 | 相邻路线步骤**进入时间**的最大间隔（秒），须 > 0；下一目标超时未出现即记 `missing` |
+
+服务**先按既有算法识别停留并完成围栏点面归属**（与 `/api/v1/geofence-visits` 完全一致），
+再把停留归属序列压缩为**围栏访问事件流**后做有序消费：
+
+1. **跳过未命中**：中心点未命中任何围栏的停留（`zone_id: null`）不产生事件，也不打断连续性；
+2. **连续停留合并**：同一围栏的连续停留（中间可夹未命中停留）只算**一次**访问事件，
+   事件保留全部命中停留的 `stay_ids`，进入 / 离开时间取组内首入 / 末离；
+   因此路线 `["A", "B", "A"]` 中两次 A 步骤必须分别由两次独立的 A 访问消费；
+3. **有序消费**：事件围栏等于当前期望围栏 → 该步骤 `matched: true`，进入下一目标；
+   事件围栏不等于当前期望围栏 → 记录 **`unexpected`** 违规（目标指针不动，继续等待）；
+4. **时限缺失**：设置 `max_step_gap_s` 后，以上一已匹配步骤的进入时间为锚点，
+   下一目标须在 `锚点 + max_step_gap_s` 时刻（**含等号**）之前出现，否则记 **`missing`**；
+   缺失步骤的截止时刻按相同时限**链式推进**（每个路线步骤各占一个时间槽）。
+   迟到的期望到访按 `missing` 结算、事件一并消费（不再另记 `unexpected`），步骤不回补匹配；
+   第一个目标没有前序锚点，不受时限约束；
+5. **收尾缺失**：轨迹结束仍未消费的目标步骤一律记为 `missing`（`deadline_time` 为 `null`）；
+6. `overall_pass` 在无任何违规（`missing` / `unexpected` 均为空）时为 `true`。
+
+**请求示例**
+
+```bash
+curl -X POST http://localhost:8000/api/v1/geofence-route-check \
+  -H 'Content-Type: application/json' \
+  -d @examples/geofence_route_check_request.json
+```
+
+`examples/geofence_route_check_request.json` 描述的场景：半天内 4 次停留——家 08:00、
+公司 08:30、咖啡馆 09:00、家 09:30，相邻进入间隔均为 30 分钟；路线为
+`zone-home → zone-work → zone-cafe → zone-home`（首尾同围栏，要求两次独立到访），
+`max_step_gap_s=2400`（40 分钟）。每一步都在时限内按序出现，`overall_pass` 为 `true`。
+若把路线改为 `zone-home → zone-work → zone-cafe` 而实际顺序不变（家 → 公司 → 咖啡馆），
+本可通过；若实际顺序变成家 → 咖啡馆 → 公司，则咖啡馆到访会记 `unexpected`
+（当时期望目标还是 `zone-work`），最后公司到访时 `zone-cafe` 仍未消费，记 `missing`。
+
+**响应示例**（实际输出，即上述请求）
+
+```json
+{
+  "matched_stay_ids": [1, 2, 3, 4],
+  "route_steps": [
+    {"step_index": 1, "zone_id": "zone-home", "matched": true, "stay_ids": [1],
+     "entry_time": "2026-09-21T08:00:00Z", "exit_time": "2026-09-21T08:03:00Z", "gap_s": null},
+    {"step_index": 2, "zone_id": "zone-work", "matched": true, "stay_ids": [2],
+     "entry_time": "2026-09-21T08:30:00Z", "exit_time": "2026-09-21T08:33:00Z", "gap_s": 1800.0},
+    {"step_index": 3, "zone_id": "zone-cafe", "matched": true, "stay_ids": [3],
+     "entry_time": "2026-09-21T09:00:00Z", "exit_time": "2026-09-21T09:03:00Z", "gap_s": 1800.0},
+    {"step_index": 4, "zone_id": "zone-home", "matched": true, "stay_ids": [4],
+     "entry_time": "2026-09-21T09:30:00Z", "exit_time": "2026-09-21T09:33:00Z", "gap_s": 1800.0}
+  ],
+  "violations": [],
+  "overall_pass": true
+}
+```
+
+**响应字段**
+
+| 字段 | 说明 |
+| --- | --- |
+| `matched_stay_ids` | 所有匹配访问事件消费的停留 `stay_id`（按访问时间升序；连续同围栏停留已合并去重） |
+| `route_steps[]` | 按顺序的逐步骤核对结果，长度与 `ordered_zone_ids` 一致（重复编号分别成步） |
+| `route_steps[].step_index` | 路线步骤序号，从 1 开始 |
+| `route_steps[].matched` | 是否按序、按时命中 |
+| `route_steps[].stay_ids` | 匹配访问事件所含停留编号（合并后的多次连续停留）；未匹配为 `[]` |
+| `route_steps[].entry_time / exit_time` | 匹配访问的首入 / 末离时间；未匹配均为 `null` |
+| `route_steps[].gap_s` | 匹配进入时间相对上一已匹配步骤进入时间的间隔（秒）；第一步为 `null` |
+| `violations[].type` | `missing`（目标未出现 / 超时）或 `unexpected`（非当前目标到访） |
+| `violations[].step_index` | `missing` 对应的步骤序号；`unexpected` 不属于任何步骤，为 `null` |
+| `violations[].zone_id` | `missing`：缺失的围栏编号；`unexpected`：实际到访的围栏编号 |
+| `violations[].stay_ids / entry_time` | `unexpected` 访问事件的停留编号与进入时间；`missing` 为 `[]` / `null` |
+| `violations[].expected_zone_id` | `unexpected` 发生时当前期望的围栏编号（路线已走完为 `null`）；`missing` 为 `null` |
+| `violations[].deadline_time` | 超时缺失的截止时刻（锚点 + 时限，链式推进）；轨迹结束仍未出现或未设时限时为 `null` |
+| `overall_pass` | 无任何违规时为 `true` |
+
+### 5. `POST /api/v1/stays/geojson` — GeoJSON 结果
 
 请求体与上相同。返回 `application/geo+json` 的 `FeatureCollection`：
 
@@ -308,7 +397,7 @@ curl -X POST http://localhost:8000/api/v1/stays/geojson \
   -d @examples/request.json | jq .
 ```
 
-### 5. `GET /health` — 健康检查
+### 6. `GET /health` — 健康检查
 
 ```json
 {"status": "ok"}
@@ -357,6 +446,22 @@ curl -X POST http://localhost:8000/api/v1/stays/geojson \
 5. 汇总按请求中围栏顺序输出 `visit_count`（命中停留段数）与 `total_duration_s`
    （命中停留时长之和），零访问围栏保留 0 值。
 
+### 围栏路线有序核对（`app/route_check.py`）
+
+在停留归属结果之上做“路线 vs 实际到访”的有序消费（纯函数，无第三方依赖）：
+
+1. **事件流压缩**（`build_visit_events`）：按停留时间顺序扫描归属序列，`None`（未命中）
+   直接跳过且不打断连续性；相邻同围栏停留合并为一次访问事件，`stay_ids` 保留全部命中停留，
+   `entry_time` / `exit_time` 取组内首停留进入 / 末停留离开时间；
+2. **有序消费**（`check_route`）：维护当前期望步骤指针；事件围栏等于期望围栏则匹配并推进，
+   否则记一条 `unexpected`（指针不动，期望目标继续等待）；
+3. **时限链式推进**：设置 `max_step_gap_s` 时，在每个事件进入时间到来前，先把已超过
+   `锚点 + gap`（等号不算超时）的期望步骤逐个记为 `missing`，锚点随每个缺失步骤推进一个
+   `gap`（每个路线步骤各占一个时间槽）；迟到事件的围栏若属于本轮刚超时的步骤，则事件静默
+   消费（步骤保持 `missing`，不重复记 `unexpected`）；第一步以前序匹配为锚点，故不做时限；
+4. **收尾**：轨迹结束后未消费的步骤全部记为 `missing`（无截止时刻）；
+   `matched_stay_ids` 为各匹配事件停留编号的顺序并集，`overall_pass = 无任何违规`。
+
 > 注意：输入轨迹须按时间升序排列；`start_index` / `end_index` 对应请求数组中的原始下标。
 
 ## 项目结构
@@ -364,22 +469,26 @@ curl -X POST http://localhost:8000/api/v1/stays/geojson \
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 应用与路由（/stays、/hotspots、/geofence-visits、/stays/geojson）
+│   ├── main.py          # FastAPI 应用与路由（/stays、/hotspots、/geofence-visits、/geofence-route-check、/stays/geojson）
 │   ├── models.py        # Pydantic 请求 / 响应模型（含 GeoJSON Polygon/MultiPolygon 校验）
 │   ├── staypoint.py     # Haversine 与停留检测核心算法（纯函数）
 │   ├── hotspot.py       # 热点归并：连通分量（并查集）+ 时长加权中心（纯函数）
-│   └── geofence.py      # 围栏点面归属：射线法 + 孔洞 + 跨 180° 经线连续化（纯函数）
+│   ├── geofence.py      # 围栏点面归属：射线法 + 孔洞 + 跨 180° 经线连续化（纯函数）
+│   └── route_check.py   # 围栏路线有序核对：访问事件压缩 + 缺失/超时/非序违规（纯函数）
 ├── tests/
 │   ├── test_api.py          # /stays 接口集成测试（TestClient）
 │   ├── test_staypoint.py    # 停留检测算法单元测试
 │   ├── test_hotspot.py      # 热点归并算法单元测试（传递扩展、顺序无关、稳定编号）
 │   ├── test_hotspot_api.py  # /hotspots 接口集成测试
 │   ├── test_geofence.py     # 围栏归属算法单元测试（边界、孔洞、跨经线、决胜、汇总）
-│   └── test_geofence_api.py # /geofence-visits 接口集成测试
+│   ├── test_geofence_api.py # /geofence-visits 接口集成测试
+│   ├── test_route_check.py  # 路线核对算法单元测试（连续合并、重复路线、超时链、missing/unexpected）
+│   └── test_geofence_route_check_api.py # /geofence-route-check 接口集成测试
 ├── examples/
 │   ├── request.json         # /stays 示例请求体
 │   ├── hotspot_request.json # /hotspots 示例请求体
-│   └── geofence_request.json # /geofence-visits 示例请求体
+│   ├── geofence_request.json # /geofence-visits 示例请求体
+│   └── geofence_route_check_request.json # /geofence-route-check 示例请求体
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt       # 运行依赖
@@ -393,9 +502,13 @@ pip install -r requirements-dev.txt
 pytest tests/ -v
 ```
 
-共 43 个用例，覆盖 Haversine 距离、停留合并、最短时长过滤、采样间断切分、跨 180° 经线簇中心、
+共 64 个用例，覆盖 Haversine 距离、停留合并、最短时长过滤、采样间断切分、跨 180° 经线簇中心、
 GeoJSON 结构、参数校验（422），热点的链式传递扩展、多分量与噪声标记、
 `min_visits` 过滤、半径边界（含等号）、时长加权中心、最早访问时间稳定编号、
 打乱 / 颠倒输入顺序后的结果确定性，以及围栏的外环边界命中、洞内 / 洞边界未命中、
 跨 180° 经线多边形（含反向编码与 MultiPolygon）、孔洞参考系对齐、
-priority + zone_id 决胜（与输入顺序无关）、零访问围栏保留等。
+priority + zone_id 决胜（与输入顺序无关）、零访问围栏保留；
+路线核对覆盖未命中停留跳过与同围栏连续停留合并、允许重复的路线步骤、
+`unexpected` 非序到访、`missing` 未出现 / 收尾缺失、`max_step_gap_s` 等号边界与
+链式截止时刻、迟到事件静默消费、路线走完后的额外到访，以及 ordered_zone_ids
+未知编号 / 空列表、非正时限等参数校验（422）。
