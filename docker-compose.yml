@@ -1,0 +1,8 @@
+services:
+  staypoint-api:
+    build: .
+    image: staypoint-api:latest
+    container_name: staypoint-api
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
