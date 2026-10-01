@@ -6,7 +6,10 @@
 并附带 **GeoJSON** 结果与**总里程、停留次数**等统计。`/api/v1/hotspots` 进一步在停留结果之上
 以**中心连通分量**归并跨时段重复到访，输出热点（含传递扩展、稳定编号、时长加权中心）与噪声标记；
 `/api/v1/geofence-visits` 则以停留**中心点**对带洞、可跨 180° 经线的 GeoJSON 围栏做点面归属，
-返回每段停留的 `zone_id`（未命中为 `null`）及按围栏汇总的访问次数与累计停留时长。
+返回每段停留的 `zone_id`（未命中为 `null`）及按围栏汇总的访问次数与累计停留时长；
+`/api/v1/geofence-route-check` 在围栏归属之上按**停留进入时间**核对轨迹是否依给定路线
+顺序访问围栏（同一围栏连续停留只算一次、未命中停留跳过），输出逐步核对结果、
+`missing` / `unexpected` 违规与整体通过判定。
 
 ## 功能特性
 
@@ -20,6 +23,9 @@
 - **围栏访问统计**：GeoJSON Polygon / MultiPolygon 点面归属；外环边界视为命中，洞内及洞边界视为
   未命中；多边形可跨越 180° 经线（无需预切割）；多围栏同时命中按 `priority` 降序、`zone_id`
   字典序唯一决胜；汇总保留零访问围栏
+- **路线顺序核对**：按停留进入时间消费围栏命中事件（同一围栏连续停留折叠为一次、未命中停留跳过），
+  严格按 `ordered_zone_ids` 顺序匹配；支持 `max_step_gap_s` 相邻目标时限（超时记 `missing` 且
+  时限顺延），非当前目标记 `unexpected`，输出逐步结果、违规明细与整体通过判定
 - 时间戳兼容 ISO 8601 字符串与 Unix 秒（epoch）；参数校验失败返回 422
 
 ## 快速开始
@@ -295,7 +301,78 @@ curl -X POST http://localhost:8000/api/v1/geofence-visits \
 | `geofences[].stay_ids` | 命中该围栏的停留 `stay_id`（升序） |
 | `stats` | 与 `/api/v1/stays` 相同的整体统计 |
 
-### 4. `POST /api/v1/stays/geojson` — GeoJSON 结果
+### 4. `POST /api/v1/geofence-route-check` — 路线顺序核对
+
+**请求体**：完整沿用 `POST /api/v1/geofence-visits` 的全部字段（`points`、`distance_threshold_m`、
+`min_stay_duration_s`、`max_gap_s`、`geofences`），并额外要求：
+
+| 字段 | 类型 | 必填 | 默认值 | 说明 |
+| --- | --- | --- | --- | --- |
+| `ordered_zone_ids` | array[string] | 是 | — | 期望**依次**到访的围栏编号序列：允许重复、允许空数组；每个编号必须出现在 `geofences` 中，否则 422 |
+| `max_step_gap_s` | float | 否 | `null` | 相邻两个目标停留**进入时间**的最大间隔（秒），须 > 0；为空时不设时限 |
+
+服务**先按既有算法识别停留并做围栏归属**（与 `/api/v1/geofence-visits` 完全一致），再按
+**停留进入时间**顺序消费命中事件，严格对照 `ordered_zone_ids` 逐步核对：
+
+- **事件流**：未命中任何围栏的停留跳过；同一围栏的**连续**停留折叠为一次到访
+  （取首段停留的 `stay_id` 与进入时间代表）；
+- **matched**：事件命中当前目标 → 该步匹配，目标指针前进；
+- **unexpected**：事件不是当前目标（或路线已完成后仍有到访）→ 记 `unexpected` 违规，
+  事件被丢弃，不参与匹配、也不影响时限锚点；
+- **missing**：设了 `max_step_gap_s` 时，当前目标须在上一个匹配停留的进入时间
+  （**首个目标以轨迹首点时间为锚**）起 `max_step_gap_s` 秒内出现（含等号边界）；
+  超时记 `missing`，后续目标的时限以被跳过目标的时限为锚**顺延**；
+  轨迹结束后仍未匹配的目标一律记 `missing`；
+- `overall_pass`：全部目标匹配且无任何 `missing` / `unexpected` 时为 `true`。
+
+**请求示例**
+
+```bash
+curl -X POST http://localhost:8000/api/v1/geofence-route-check \
+  -H 'Content-Type: application/json' \
+  -d @examples/route_check_request.json
+```
+
+`examples/route_check_request.json` 描述的场景：一天内 4 次停留——家 → 公司 → 咖啡馆 → 家，
+期望路线 `["zone-home", "zone-work", "zone-cafe", "zone-home"]`（允许重复），
+相邻目标时限 3900 秒；实际顺序与路线一致且均在时限内，整体通过。
+
+**响应示例**（实际输出）
+
+```json
+{
+  "matched_stay_ids": [1, 2, 3, 4],
+  "route_steps": [
+    {"step_index": 1, "zone_id": "zone-home", "status": "matched", "stay_id": 1, "enter_time": "2026-09-21T08:00:00Z"},
+    {"step_index": 2, "zone_id": "zone-work", "status": "matched", "stay_id": 2, "enter_time": "2026-09-21T09:00:00Z"},
+    {"step_index": 3, "zone_id": "zone-cafe", "status": "matched", "stay_id": 3, "enter_time": "2026-09-21T10:00:00Z"},
+    {"step_index": 4, "zone_id": "zone-home", "status": "matched", "stay_id": 4, "enter_time": "2026-09-21T11:00:00Z"}
+  ],
+  "violations": [],
+  "overall_pass": true
+}
+```
+
+**响应字段**
+
+| 字段 | 说明 |
+| --- | --- |
+| `matched_stay_ids` | 按匹配顺序的停留 `stay_id`（折叠段取首段停留） |
+| `route_steps[]` | 按 `ordered_zone_ids` 顺序的逐步核对结果，每个目标一项 |
+| `route_steps[].step_index` | 步序号，从 1 开始 |
+| `route_steps[].zone_id` | 该步期望到访的围栏编号 |
+| `route_steps[].status` | `matched`=在时限内到访；`missing`=未（及时）出现 |
+| `route_steps[].stay_id / enter_time` | 匹配到的停留编号与进入时间；`missing` 时为 `null` |
+| `violations[]` | 按发生顺序的违规记录 |
+| `violations[].type` | `missing` 或 `unexpected` |
+| `violations[].zone_id` | `missing`：未出现的期望围栏；`unexpected`：实际命中的围栏 |
+| `violations[].step_index` | `missing`：缺失目标的步序号；`unexpected` 为 `null` |
+| `violations[].stay_id / enter_time` | `unexpected`：触发违规的停留编号与进入时间；`missing` 为 `null` |
+| `violations[].expected_zone_id` | `unexpected`：当时期望的围栏（路线已完成后为 `null`）；`missing` 为 `null` |
+| `violations[].deadline_time` | `missing`：该目标的到访时限（未设 `max_step_gap_s` 时为 `null`）；`unexpected` 为 `null` |
+| `overall_pass` | 全部目标在时限内按序匹配且无任何违规时为 `true` |
+
+### 5. `POST /api/v1/stays/geojson` — GeoJSON 结果
 
 请求体与上相同。返回 `application/geo+json` 的 `FeatureCollection`：
 
@@ -308,7 +385,7 @@ curl -X POST http://localhost:8000/api/v1/stays/geojson \
   -d @examples/request.json | jq .
 ```
 
-### 5. `GET /health` — 健康检查
+### 6. `GET /health` — 健康检查
 
 ```json
 {"status": "ok"}
@@ -357,6 +434,20 @@ curl -X POST http://localhost:8000/api/v1/stays/geojson \
 5. 汇总按请求中围栏顺序输出 `visit_count`（命中停留段数）与 `total_duration_s`
    （命中停留时长之和），零访问围栏保留 0 值。
 
+### 路线顺序核对（`app/routecheck.py`）
+
+在停留区段与围栏归属结果之上，核对轨迹是否按给定路线依次访问围栏：
+
+1. **事件流**：按停留进入时间顺序消费命中围栏的停留——未命中（`null`）的停留跳过；
+   同一围栏的连续命中折叠为一次到访，取首段停留的 `stay_id` 与进入时间代表；
+2. **严格顺序匹配**：维护当前目标指针，逐个事件处理——命中当前目标则该步 `matched`
+   （时限锚点更新为该停留进入时间）；否则记 `unexpected` 并丢弃该事件
+   （不影响目标指针与时限锚点）；
+3. **时限**：设了 `max_step_gap_s` 时，当前目标的到访时限 = 锚点时间 + `max_step_gap_s`
+   （首个目标以轨迹首点时间为锚，含等号边界）；事件到达时已超过时限的目标依次记
+   `missing`，且锚点顺延一个间隔（后续目标按顺延后的时限判定）；
+4. 轨迹结束后仍未匹配的目标一律记 `missing`；`overall_pass` = 无任何违规。
+
 > 注意：输入轨迹须按时间升序排列；`start_index` / `end_index` 对应请求数组中的原始下标。
 
 ## 项目结构
@@ -364,22 +455,26 @@ curl -X POST http://localhost:8000/api/v1/stays/geojson \
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 应用与路由（/stays、/hotspots、/geofence-visits、/stays/geojson）
+│   ├── main.py          # FastAPI 应用与路由（/stays、/hotspots、/geofence-visits、/geofence-route-check、/stays/geojson）
 │   ├── models.py        # Pydantic 请求 / 响应模型（含 GeoJSON Polygon/MultiPolygon 校验）
 │   ├── staypoint.py     # Haversine 与停留检测核心算法（纯函数）
 │   ├── hotspot.py       # 热点归并：连通分量（并查集）+ 时长加权中心（纯函数）
-│   └── geofence.py      # 围栏点面归属：射线法 + 孔洞 + 跨 180° 经线连续化（纯函数）
+│   ├── geofence.py      # 围栏点面归属：射线法 + 孔洞 + 跨 180° 经线连续化（纯函数）
+│   └── routecheck.py    # 路线顺序核对：事件流折叠 + 严格顺序匹配 + 时限顺延（纯函数）
 ├── tests/
-│   ├── test_api.py          # /stays 接口集成测试（TestClient）
-│   ├── test_staypoint.py    # 停留检测算法单元测试
-│   ├── test_hotspot.py      # 热点归并算法单元测试（传递扩展、顺序无关、稳定编号）
-│   ├── test_hotspot_api.py  # /hotspots 接口集成测试
-│   ├── test_geofence.py     # 围栏归属算法单元测试（边界、孔洞、跨经线、决胜、汇总）
-│   └── test_geofence_api.py # /geofence-visits 接口集成测试
+│   ├── test_api.py            # /stays 接口集成测试（TestClient）
+│   ├── test_staypoint.py      # 停留检测算法单元测试
+│   ├── test_hotspot.py        # 热点归并算法单元测试（传递扩展、顺序无关、稳定编号）
+│   ├── test_hotspot_api.py    # /hotspots 接口集成测试
+│   ├── test_geofence.py       # 围栏归属算法单元测试（边界、孔洞、跨经线、决胜、汇总）
+│   ├── test_geofence_api.py   # /geofence-visits 接口集成测试
+│   ├── test_routecheck.py     # 路线核对算法单元测试（折叠、顺序、时限顺延、违规）
+│   └── test_routecheck_api.py # /geofence-route-check 接口集成测试
 ├── examples/
-│   ├── request.json         # /stays 示例请求体
-│   ├── hotspot_request.json # /hotspots 示例请求体
-│   └── geofence_request.json # /geofence-visits 示例请求体
+│   ├── request.json             # /stays 示例请求体
+│   ├── hotspot_request.json     # /hotspots 示例请求体
+│   ├── geofence_request.json    # /geofence-visits 示例请求体
+│   └── route_check_request.json # /geofence-route-check 示例请求体
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt       # 运行依赖
@@ -393,9 +488,12 @@ pip install -r requirements-dev.txt
 pytest tests/ -v
 ```
 
-共 43 个用例，覆盖 Haversine 距离、停留合并、最短时长过滤、采样间断切分、跨 180° 经线簇中心、
+共 65 个用例，覆盖 Haversine 距离、停留合并、最短时长过滤、采样间断切分、跨 180° 经线簇中心、
 GeoJSON 结构、参数校验（422），热点的链式传递扩展、多分量与噪声标记、
 `min_visits` 过滤、半径边界（含等号）、时长加权中心、最早访问时间稳定编号、
-打乱 / 颠倒输入顺序后的结果确定性，以及围栏的外环边界命中、洞内 / 洞边界未命中、
+打乱 / 颠倒输入顺序后的结果确定性，围栏的外环边界命中、洞内 / 洞边界未命中、
 跨 180° 经线多边形（含反向编码与 MultiPolygon）、孔洞参考系对齐、
-priority + zone_id 决胜（与输入顺序无关）、零访问围栏保留等。
+priority + zone_id 决胜（与输入顺序无关）、零访问围栏保留，
+以及路线核对的连续同围栏折叠、未命中停留跳过、严格顺序匹配、
+`max_step_gap_s` 超时记 missing 与时限顺延（含等号边界、首目标锚定轨迹起点）、
+unexpected 违规（含路线完成后）、空路线与重复目标等。
